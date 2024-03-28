@@ -1,99 +1,71 @@
 #include <stdio.h>
 #include <stdlib.h>
-#include <netdb.h>
-#include <signal.h>
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
-#include <fcntl.h>
+#include <sys/errno.h>
 #include <string.h>
+#include <arpa/inet.h>
 
 #define SERV_PORT 5134
-#define MAXDATA   1024
 
 #define MAXNAME 1024
-int main(int argc, char **argv){
-        int fd;     /* fd into transport provider */
-        int i;     /* loops through user name */
-        int length;    /* length of message */
-        int size;    /* the length of servaddr */
-        int fdesc;    /* file description */
-        int ndata;    /* the number of file data */
-        char data[MAXDATA]; /* read data form file */
-        char data1[MAXDATA];  /*server response a string */
-        char buf[BUFSIZ];     /* holds message from server */
-        struct hostent *hp;   /* holds IP address of server */
-        struct sockaddr_in myaddr;   /* address that client uses */
-        struct sockaddr_in servaddr; /* the server's full addr */
 
+extern int errno;
+
+main(){
+        int socket_fd;   /* file description into transport */
+        int recfd; /* file descriptor to accept        */
+        int length; /* length of address structure      */
+        int nbytes; /* the number of read **/
+        char buf[BUFSIZ];
+        struct sockaddr_in myaddr; /* address of this service */
+        struct sockaddr_in client_addr; /* address of client    */
         /*
-         * Check for proper usage.
+         *      Get a socket into UDP/IP
          */
-        if (argc < 3) {
-                fprintf (stderr, "Usage: %s host_name(IP address) file_name\n", argv[0]);
-                exit(2);
+        if ((socket_fd = socket(AF_INET, SOCK_DGRAM, 0)) <0) {
+                perror ("socket failed");
+                exit(EXIT_FAILURE);
         }
         /*
-         *  Get a socket into UDP
+         *    Set up our address
          */
-        if ((fd = socket(AF_INET, SOCK_DGRAM, 0)) < 0) {
-                perror ("socket failed!");
-                exit(1);
-        }
-        /*
-         * Bind to an arbitrary return address.
-         */
-        bzero((char *)&myaddr, sizeof(myaddr));
+        bzero ((char *)&myaddr, sizeof(myaddr));
         myaddr.sin_family = AF_INET;
         myaddr.sin_addr.s_addr = htonl(INADDR_ANY);
-        myaddr.sin_port = htons(0);
+        myaddr.sin_port = htons(SERV_PORT);
 
-        if (bind(fd, (struct sockaddr *)&myaddr,
-                                sizeof(myaddr)) <0) {
-                perror("bind failed!");
-                exit(1);
-        }
         /*
-         * Fill in the server's UDP/IP address
+         *     Bind to the address to which the service will be offered
          */
-
-        bzero((char *)&servaddr, sizeof(servaddr));
-        servaddr.sin_family = AF_INET;
-        servaddr.sin_port = htons(SERV_PORT);
-        hp = gethostbyname(argv[1]);
-
-        if (hp == 0) {
-                fprintf(stderr, "could not obtain address of %s\n", argv[2]);
-                return (-1);
-        }
-        bcopy(hp->h_addr_list[0], (caddr_t)&servaddr.sin_addr,
-                        hp->h_length);
-
-        /**開起檔案讀取文字 **/
-        fdesc = open(argv[2], O_RDONLY);
-        if (fdesc == -1) {
-                perror("open file error!");
-                exit (1);
-        }
-        ndata = read (fdesc, data, MAXDATA);
-        if (ndata < 0) {
-                perror("read file error !");
-                exit (1);
-        }
-        data[ndata + 1] = '\0';
-
-        /* 發送資料給 Server */
-        size = sizeof(servaddr);
-        if (sendto(fd, data, ndata, 0, (struct sockaddr*)&servaddr, size) == -1) {
-                perror("write to server error !");
+        if (bind(socket_fd, (struct sockaddr *)&myaddr, sizeof(myaddr)) <0) {
+                perror ("bind failed\n");
                 exit(1);
         }
-        /** 由伺服器接收回應 **/
-        if (recvfrom(fd, data1, MAXDATA, 0, (struct sockaddr*)&servaddr, &size) < 0) {
-                perror ("read from server error !");
-                exit (1);
-        }
-        /* 印出 server 回應 **/
-        printf("%s\n", data1);
 
+        /*
+         * Loop continuously, waiting for datagrams
+         * and response a message
+         */
+        length = sizeof(client_addr);
+        printf("Server is ready to receive !!\n");
+        printf("Can strike Cntrl-c to stop Server >>\n");
+        while (1) {
+                if ((nbytes = recvfrom(socket_fd, &buf, MAXNAME, 0, (struct sockaddr*)&client_addr, (socklen_t *)&length)) <0) {
+                        perror ("could not read datagram!!");
+                        continue;
+                }
+
+
+                printf("Received data form %s : %d\n", inet_ntoa(client_addr.sin_addr), htons(client_addr.sin_port));
+                printf("%s\n", buf);
+
+                /* return to client */
+                if (sendto(socket_fd, &buf, nbytes, 0, (struct sockaddr*)&client_addr, length) < 0) {
+                        perror("Could not send datagram!!\n");
+                        continue;
+                }
+                printf("Can Strike Crtl-c to stop Server >>\n");
+        }
 }
