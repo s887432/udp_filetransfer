@@ -1,99 +1,250 @@
+// Client side implementation of UDP client-server model
 #include <stdio.h>
 #include <stdlib.h>
-#include <netdb.h>
-#include <signal.h>
+#include <unistd.h>
+#include <string.h>
 #include <sys/types.h>
 #include <sys/socket.h>
+#include <arpa/inet.h>
 #include <netinet/in.h>
-#include <fcntl.h>
-#include <string.h>
+	
+#define TRANS_ACK_SUCCESS	0x55AA00
+#define TRANS_ACK_FAILURE	0x55AA01
+#define TRANS_RETRY 0x55AA02
 
-#define SERV_PORT 5134
-#define MAXDATA   1024
+#define CMD_NEXT_KEEPGOING	1
+#define CMD_NEXT_FINISHED	2
 
-#define MAXNAME 1024
-int main(int argc, char **argv){
-        int fd;     /* fd into transport provider */
-        int i;     /* loops through user name */
-        int length;    /* length of message */
-        int size;    /* the length of servaddr */
-        int fdesc;    /* file description */
-        int ndata;    /* the number of file data */
-        char data[MAXDATA]; /* read data form file */
-        char data1[MAXDATA];  /*server response a string */
-        char buf[BUFSIZ];     /* holds message from server */
-        struct hostent *hp;   /* holds IP address of server */
-        struct sockaddr_in myaddr;   /* address that client uses */
-        struct sockaddr_in servaddr; /* the server's full addr */
+typedef struct __TRANS_INFO__
+{
+	int sockfd;
+	struct sockaddr_in *sockaddr;
+	socklen_t addrlen;
+}tTransInfo,*ptTransInfo;
 
-        /*
-         * Check for proper usage.
-         */
-        if (argc < 3) {
-                fprintf (stderr, "Usage: %s host_name(IP address) file_name\n", argv[0]);
-                exit(2);
-        }
-        /*
-         *  Get a socket into UDP
-         */
-        if ((fd = socket(AF_INET, SOCK_DGRAM, 0)) < 0) {
-                perror ("socket failed!");
-                exit(1);
-        }
-        /*
-         * Bind to an arbitrary return address.
-         */
-        bzero((char *)&myaddr, sizeof(myaddr));
-        myaddr.sin_family = AF_INET;
-        myaddr.sin_addr.s_addr = htonl(INADDR_ANY);
-        myaddr.sin_port = htons(0);
+unsigned int checksum(unsigned char *buf, int length)
+{
+	unsigned int sum = 0;
+	
+	for(int i=0; i<length; i++)
+	{
+		sum += (unsigned int)(*(buf+i));
+	}
+	
+	return sum;
+}
 
-        if (bind(fd, (struct sockaddr *)&myaddr,
-                                sizeof(myaddr)) <0) {
-                perror("bind failed!");
-                exit(1);
-        }
-        /*
-         * Fill in the server's UDP/IP address
-         */
+int sendPackage(ptTransInfo sockInfo, void *buf, int send_size)
+{
+	int byteLeft;
+	int ack = TRANS_ACK_SUCCESS;
+	int retval;
+	
+	byteLeft = send_size;
+	
+	int len = sizeof(struct sockaddr_in);
+	int index = 0;
+	while( index < send_size )
+	{
+		retval = sendto(sockInfo->sockfd, buf+index, byteLeft, MSG_CONFIRM, (struct sockaddr *) sockInfo->sockaddr, len);
+		
+		if( retval == -1 )
+		{
+			printf("Send package error error\r\n");
+			ack = TRANS_ACK_FAILURE;	
+			break;
+		}
+		
+		index += retval;
+		byteLeft -= retval;
+	}
+	
+	// waiting for ack
+	byteLeft = sizeof(int);
+	retval = recvfrom(sockInfo->sockfd, &ack, byteLeft, MSG_WAITALL, (struct sockaddr *) sockInfo->sockaddr, &len);
+	if( retval != byteLeft || ack != TRANS_ACK_SUCCESS)
+	{
+		printf("%d@%d, %X\r\n", retval, byteLeft, ack);
+		printf("receive ack error\r\n");
+	}
+	
+	return (ack == TRANS_ACK_SUCCESS) ? send_size : -1;	
+}
 
-        bzero((char *)&servaddr, sizeof(servaddr));
-        servaddr.sin_family = AF_INET;
-        servaddr.sin_port = htons(SERV_PORT);
-        hp = gethostbyname(argv[1]);
+int sendFile(ptTransInfo sockInfo, int section_size, const char *filename)
+{
+	int file_size;
+	unsigned char *file_ptr;
+	int retval;
+	int transferSize;
+	int ack;
+	int ret = 0;
+	int index = 0;
+	
+	// get file size
+	FILE *fp = fopen(filename, "rb");
+	fseek(fp, 0L, SEEK_END);
+	file_size = ftell(fp);
+	fseek(fp, 0L, SEEK_SET);
 
-        if (hp == 0) {
-                fprintf(stderr, "could not obtain address of %s\n", argv[2]);
-                return (-1);
-        }
-        bcopy(hp->h_addr_list[0], (caddr_t)&servaddr.sin_addr,
-                        hp->h_length);
+	// read file data
+	file_ptr = (unsigned char*)malloc(file_size);
+	fread(file_ptr, file_size, 1, fp);
+	fclose(fp);
+	
+	// 1. send file size
+	printf("File size %d bytes\r\n", file_size);
+	retval = sendPackage(sockInfo, (void*)&file_size, sizeof(file_size));
+	if( retval != sizeof(file_size) )
+	{
+		printf("Send file size error\r\n");
+		ret = -1;
+		goto exit;
+	}
+	
+	// 2. send section size	
+	printf("Section size %d bytes\r\n", section_size);
+	retval = sendPackage(sockInfo, (void*)&section_size, sizeof(section_size));
+	if( retval != sizeof(section_size) )
+	{
+		printf("Send section size error\r\n");
+		ret = -1;
+		goto exit;
+	}
+	
+	// 3. send file data
+	printf("checksum = %08X\r\n", checksum(file_ptr, file_size));
+	do
+	{
+		int len = ((index+section_size) > file_size) ? (file_size-index) : section_size;
+		retval = sendPackage(sockInfo, (void*)(file_ptr+index), len);
+		printf("Sent %d bytes\r\n", retval);
+		if( retval != len )
+		{
+			printf("Receive data error\r\n");
+			ret = -1;
+			goto exit;
+		}
+		
+		index += section_size;
+	}while(index < file_size);
 
-        /**開起檔案讀取文字 **/
-        fdesc = open(argv[2], O_RDONLY);
-        if (fdesc == -1) {
-                perror("open file error!");
-                exit (1);
-        }
-        ndata = read (fdesc, data, MAXDATA);
-        if (ndata < 0) {
-                perror("read file error !");
-                exit (1);
-        }
-        data[ndata + 1] = '\0';
+exit:	
+	free(file_ptr);
+	
+	return ret;
+}
 
-        /* 發送資料給 Server */
-        size = sizeof(servaddr);
-        if (sendto(fd, data, ndata, 0, (struct sockaddr*)&servaddr, size) == -1) {
-                perror("write to server error !");
-                exit(1);
-        }
-        /** 由伺服器接收回應 **/
-        if (recvfrom(fd, data1, MAXDATA, 0, (struct sockaddr*)&servaddr, &size) < 0) {
-                perror ("read from server error !");
-                exit (1);
-        }
-        /* 印出 server 回應 **/
-        printf("%s\n", data1);
+int sendNextCommand(ptTransInfo sockInfo, int next_command)
+{
+	int transferSize = 0;
+	int retval = 0;
+	int ret = 0;
+	int ack = 0;
+	
+	printf("Next command=%X\r\n", next_command);
+	// 1. send next command
+	retval = sendPackage(sockInfo, (void*)(&next_command), sizeof(next_command));
+	if( retval != sizeof(next_command) )
+	{
+		printf("Send ack error\r\n");
+		return -1;
+	}
 
+	return ret;
+}
+
+void sendFiles(ptTransInfo sockInfo, int section_size, const char *listname)
+{
+	unsigned char *file_ptr;
+	int file_size;
+	int next_command;
+	unsigned int ack = TRANS_ACK_SUCCESS;
+	// debug
+	char filename[80];
+	int ret;
+
+	FILE *fp;
+	
+	if( (fp = fopen(listname, "r")) == NULL )
+	{
+		printf("Read list file error\r\n");
+		return;
+	}
+	
+	while( fgets(filename, 80, fp) )
+	{
+		int len = strlen(filename);
+		for(int i=len-1; i>0; i--)
+		{
+			if( filename[i] <= 0x20 )
+				filename[i] = 0;
+		}
+		
+		printf("Reading [%s]\r\n", filename);
+		
+		if( strcmp(filename, "EOF") == 0 )
+		{
+			file_size = -1;
+			sendPackage(sockInfo, (void*)&file_size, sizeof(file_size));
+			
+			// end of file
+			next_command = CMD_NEXT_FINISHED;
+			
+			printf("Transfer finished\r\n");	
+		}
+		else
+		{
+			ret = sendFile(sockInfo, section_size, filename);
+			if( ret < 0 )
+			{
+				break;
+			}
+			
+			next_command = CMD_NEXT_KEEPGOING;
+			// send next com
+			sendNextCommand(sockInfo, next_command);
+		}	
+	}
+	
+	fclose(fp);
+}
+
+int main(int argc, char **argv) 
+{
+	int sockfd;
+	char *hello = "Hello from client";
+	struct sockaddr_in	 servaddr;
+	tTransInfo transInfo;
+
+	if( argc != 5 )
+	{
+		printf("USAGE: client SERVER_IP PORT SECTION_SIZE(KB) LIST_NAME\r\n");
+		return EXIT_FAILURE;
+	}
+	
+	int section_size = atoi(argv[3]);
+	int port = atoi(argv[2]);
+		
+	// Creating socket file descriptor
+	if ( (sockfd = socket(AF_INET, SOCK_DGRAM, 0)) < 0 ) {
+		perror("socket creation failed");
+		exit(EXIT_FAILURE);
+	}
+	
+	memset(&servaddr, 0, sizeof(servaddr));
+		
+	// Filling server information
+	servaddr.sin_family = AF_INET;
+	servaddr.sin_port = htons(atoi(argv[2]));
+	servaddr.sin_addr.s_addr = inet_addr(argv[1]);//INADDR_ANY;
+	
+	transInfo.sockfd = sockfd;
+	transInfo.sockaddr = (struct sockaddr_in *) &servaddr;
+	transInfo.addrlen = sizeof(servaddr);
+	
+	sendFiles(&transInfo, section_size*1024, argv[4]);
+		
+	close(sockfd);
+	return 0;
 }
